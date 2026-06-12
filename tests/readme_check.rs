@@ -152,10 +152,10 @@ async fn fetch() -> Result<String, ThrottleError> {
 #[tokio::test]
 async fn case_delay_hint() {
     let body = Retry::new()
-        .max_attempts(5)
-        .initial_backoff(Duration::from_millis(200))
+        .max_backoff(Duration::from_secs(2))
         .attempt(fetch)
         .delay_hint(|e: &ThrottleError| e.retry_after)
+        .max_delay_hint(Duration::from_secs(60))
         .await
         .unwrap();
     assert_eq!(body, "body");

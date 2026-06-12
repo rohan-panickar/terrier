@@ -3,9 +3,10 @@
 //!
 //! Build a [`Retry`] config, call `.attempt(op)` to get an awaitable [`RetryFuture`],
 //! optionally chain `.when(predicate)` to classify your error type, `.notify(fn)`
-//! to observe each failed retryable attempt, or `.delay_hint(fn)` to honor a
-//! server-supplied delay. Then `.await` directly via [`IntoFuture`], or call
-//! `.run().await` to drive it from a `tokio::spawn`. `Retry` is `Copy`.
+//! to observe each failed retryable attempt, `.delay_hint(fn)` to honor a
+//! server-supplied delay, or `.max_delay_hint(d)` to cap how large an honored hint
+//! can be. Then `.await` directly via [`IntoFuture`], or call `.run().await` to
+//! drive it from a `tokio::spawn`. `Retry` is `Copy`.
 //!
 //! The contract is general: any `FnMut() -> impl Future<Output = Result<T, E>>` whose
 //! operation is safe to re-invoke. A retry of a non-idempotent write can apply the
@@ -226,7 +227,7 @@ pub trait Policy: Sized {
         Fut: Future<Output = Result<T, E>>,
     {
         let b = self.budget();
-        RetryFuture::new_seeded(self, IndexIgnored(op), b.max_attempts, b.max_elapsed)
+        RetryFuture::new_seeded(self, IndexIgnored(op), b.max_attempts, b.max_elapsed, None)
     }
 
     /// Like [`attempt`](Policy::attempt) but passes the 0-based attempt index to the
@@ -237,7 +238,7 @@ pub trait Policy: Sized {
         Fut: Future<Output = Result<T, E>>,
     {
         let b = self.budget();
-        RetryFuture::new_seeded(self, op, b.max_attempts, b.max_elapsed)
+        RetryFuture::new_seeded(self, op, b.max_attempts, b.max_elapsed, None)
     }
 }
 
@@ -563,6 +564,36 @@ impl Policy for Retry {
             max_elapsed: self.max_elapsed,
         }
     }
+
+    fn attempt<T, E, F, Fut>(self, op: F) -> RetryFuture<T, E, IndexIgnored<F>, Fut, Self>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let b = self.budget();
+        RetryFuture::new_seeded(
+            self,
+            IndexIgnored(op),
+            b.max_attempts,
+            b.max_elapsed,
+            Some(self.max_backoff),
+        )
+    }
+
+    fn attempt_with<T, E, F, Fut>(self, op: F) -> RetryFuture<T, E, F, Fut, Self>
+    where
+        F: FnMut(u32) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let b = self.budget();
+        RetryFuture::new_seeded(
+            self,
+            op,
+            b.max_attempts,
+            b.max_elapsed,
+            Some(self.max_backoff),
+        )
+    }
 }
 
 // O(1) closed-form deterministic capped exponential delay.
@@ -587,9 +618,10 @@ fn exponential_delay(base: Duration, cap: Duration, growth: f64, attempt: u32) -
 /// because it lacks `Send + 'static` bounds on the captured state).
 ///
 /// Chain `.when(|e| ...)` to restrict retries to transient errors, `.notify(fn)` to
-/// observe each failed retryable attempt, and `.delay_hint(|e| ...)` to honor a
-/// server-supplied delay. For custom policies, `.max_attempts(n)` / `.max_elapsed(d)`
-/// set the executor's budget here.
+/// observe each failed retryable attempt, `.delay_hint(|e| ...)` to honor a
+/// server-supplied delay, and `.max_delay_hint(d)` to cap how large an honored hint
+/// can be. For custom policies, `.max_attempts(n)` / `.max_elapsed(d)` set the
+/// executor's budget here.
 ///
 /// # `IntoFuture` bounds
 ///
@@ -610,6 +642,8 @@ pub struct RetryFuture<T, E, F, Fut, P = Retry> {
     notifier: Option<Box<dyn FnMut(&E, RetryInfo) + Send>>,
     #[allow(clippy::type_complexity)]
     delay_hint: Option<Box<dyn FnMut(&E) -> Option<Duration> + Send>>,
+    // Ceiling on an honored hint. None means no policy-level cap (only SAFE_SLEEP_CAP applies).
+    max_delay_hint: Option<Duration>,
     _marker: std::marker::PhantomData<fn() -> (T, Fut)>,
 }
 
@@ -651,7 +685,13 @@ where
     Fut: Future<Output = Result<T, E>>,
     P: Policy,
 {
-    fn new_seeded(policy: P, op: F, max_attempts: u32, max_elapsed: Option<Duration>) -> Self {
+    fn new_seeded(
+        policy: P,
+        op: F,
+        max_attempts: u32,
+        max_elapsed: Option<Duration>,
+        max_delay_hint: Option<Duration>,
+    ) -> Self {
         Self {
             policy,
             op,
@@ -660,6 +700,7 @@ where
             predicate: None,
             notifier: None,
             delay_hint: None,
+            max_delay_hint,
             _marker: std::marker::PhantomData,
         }
     }
@@ -712,17 +753,34 @@ where
 
     /// Extract a server-supplied delay (e.g. an HTTP `Retry-After`) from the error.
     ///
-    /// When the closure returns `Some(d)` for an error that will retry, `d` replaces the
-    /// policy's delay for that attempt. Precedence: hint > policy delay; the budget
-    /// pre-check and the one-year sleep clamp always still apply.
-    ///
-    /// The hinted (post-clamp) sleep becomes the `previous` delay fed to the policy on
-    /// the next attempt, so a hint also widens the next decorrelated-jitter window.
+    /// When the closure returns `Some(d)` for a retryable error, `d` replaces the
+    /// policy's computed delay for that attempt. The honored hint is first clamped to
+    /// [`max_delay_hint`](RetryFuture::max_delay_hint) (default: `max_backoff` for
+    /// `Retry`; the one-year cap for custom policies), then the budget pre-check and
+    /// the one-year sleep clamp apply as usual. The hinted (post-clamp) sleep is fed
+    /// back as `previous` to the next policy draw, widening the next
+    /// decorrelated-jitter window.
     pub fn delay_hint<H>(mut self, h: H) -> Self
     where
         H: FnMut(&E) -> Option<Duration> + Send + 'static,
     {
         self.delay_hint = Some(Box::new(h));
+        self
+    }
+
+    /// Cap the delay that an honored server hint may produce.
+    ///
+    /// When `.delay_hint` returns `Some(d)`, the effective sleep is
+    /// `min(d, max_delay_hint)` before the budget pre-check and one-year clamp.
+    /// `Retry::attempt` seeds this to `max_backoff` by default, so a garbage
+    /// `Retry-After` (e.g. an epoch timestamp parsed as seconds) is bounded without
+    /// any extra configuration. Raise it — e.g. `.max_delay_hint(Duration::from_secs(300))`
+    /// — to honor a longer server delay while keeping a short policy backoff ceiling.
+    /// A custom `Policy` (e.g. `Fixed`, a closure) seeds this as `None`, leaving the
+    /// hint bounded only by the one-year cap; set it explicitly if you need a tighter
+    /// bound.
+    pub fn max_delay_hint(mut self, d: Duration) -> Self {
+        self.max_delay_hint = Some(d);
         self
     }
 
@@ -754,11 +812,15 @@ where
                         }
                     }
 
-                    // hint > policy delay; the clamp always applies (also enforces the
-                    // SAFE_SLEEP_CAP for policies whose own next_delay does not clamp).
+                    // hint > policy delay; when a hint is honored it is clamped to
+                    // max_delay_hint first, then SAFE_SLEEP_CAP always applies.
                     let raw = delay_hint
                         .as_mut()
                         .and_then(|h| h(&err))
+                        .map(|hint| {
+                            let cap = self.max_delay_hint.unwrap_or(SAFE_SLEEP_CAP);
+                            hint.min(cap)
+                        })
                         .unwrap_or_else(|| self.policy.next_delay(attempt, previous_delay));
                     let delay = raw.min(SAFE_SLEEP_CAP);
 
@@ -1858,24 +1920,97 @@ mod tests {
         );
     }
 
-    /// An absurd hint is clamped to SAFE_SLEEP_CAP just like a policy delay.
+    /// A custom policy with no max_delay_hint: a Duration::MAX hint is clamped only
+    /// by SAFE_SLEEP_CAP (behavior unchanged from pre-0.2.1 for custom-policy callers).
     #[tokio::test(start_paused = true)]
-    async fn delay_hint_clamped_to_safe_sleep_cap() {
+    async fn delay_hint_custom_policy_clamped_to_safe_sleep_cap() {
         let start = tokio::time::Instant::now();
-        let _: Result<&str, HintedError> = Retry::new()
-            .max_attempts(2)
-            .exponential(2.0)
+        // Fixed has no max_backoff; max_delay_hint seeds as None, so only SAFE_SLEEP_CAP applies.
+        let _: Result<&str, HintedError> = Fixed(Duration::from_millis(10))
             .attempt(|| async {
                 Err::<&str, _>(HintedError {
                     retry_after: Some(Duration::MAX),
+                })
+            })
+            .max_attempts(2)
+            .delay_hint(|e: &HintedError| e.retry_after)
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            SAFE_SLEEP_CAP,
+            "custom policy: Duration::MAX hint clamps only to the one-year cap"
+        );
+    }
+
+    /// With Retry and default max_backoff, an absurd hint is clamped to max_backoff.
+    #[tokio::test(start_paused = true)]
+    async fn delay_hint_default_clamped_to_max_backoff() {
+        let max_backoff = Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let _: Result<&str, HintedError> = Retry::new()
+            .max_attempts(2)
+            .max_backoff(max_backoff)
+            .exponential(2.0)
+            .attempt(|| async {
+                Err::<&str, _>(HintedError {
+                    retry_after: Some(Duration::from_secs(86_400)),
                 })
             })
             .delay_hint(|e: &HintedError| e.retry_after)
             .await;
         assert_eq!(
             start.elapsed(),
-            SAFE_SLEEP_CAP,
-            "Duration::MAX hint must clamp to the one-year cap"
+            max_backoff,
+            "Retry: a huge hint is clamped to max_backoff by default"
+        );
+    }
+
+    /// .max_delay_hint raises the cap: a hint between max_backoff and max_delay_hint passes through,
+    /// a hint above max_delay_hint is clamped to max_delay_hint.
+    #[tokio::test(start_paused = true)]
+    async fn max_delay_hint_raises_cap_above_max_backoff() {
+        let hint_60 = Duration::from_secs(86_400); // way above both caps
+        let explicit_cap = Duration::from_secs(60);
+
+        // hint > explicit_cap: clamps to 60s
+        let start = tokio::time::Instant::now();
+        let _: Result<&str, HintedError> = Retry::new()
+            .max_attempts(2)
+            .max_backoff(Duration::from_secs(2)) // short policy backoff
+            .exponential(2.0)
+            .attempt(move || async move {
+                Err::<&str, _>(HintedError {
+                    retry_after: Some(hint_60),
+                })
+            })
+            .delay_hint(|e: &HintedError| e.retry_after)
+            .max_delay_hint(explicit_cap)
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            explicit_cap,
+            "hint > max_delay_hint: must clamp to max_delay_hint"
+        );
+
+        // hint < explicit_cap: passes through unchanged
+        let small_hint = Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+        let _: Result<&str, HintedError> = Retry::new()
+            .max_attempts(2)
+            .max_backoff(Duration::from_secs(2))
+            .exponential(2.0)
+            .attempt(move || async move {
+                Err::<&str, _>(HintedError {
+                    retry_after: Some(small_hint),
+                })
+            })
+            .delay_hint(|e: &HintedError| e.retry_after)
+            .max_delay_hint(explicit_cap)
+            .await;
+        assert_eq!(
+            start.elapsed(),
+            small_hint,
+            "hint < max_delay_hint: passes through unchanged"
         );
     }
 

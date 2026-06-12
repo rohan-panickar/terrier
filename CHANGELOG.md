@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.1 - 2026-06-11
+
+### Fixed
+
+- **Honored hints are now bounded by `max_backoff` by default.** Previously, a
+  `.delay_hint` return value was clamped only by the one-year `SAFE_SLEEP_CAP`,
+  so a garbage `Retry-After` (e.g. an epoch timestamp parsed as seconds) would
+  park a retry for up to a year. With `Retry`, the honored hint is now capped at
+  `max_backoff` unless you explicitly raise it. Custom-policy callers (`Fixed`,
+  closures, user `Policy` impls) are unaffected: their `max_delay_hint` seeds as
+  `None`, preserving the previous one-year-cap behavior.
+
+### New
+
+- **`.max_delay_hint(Duration)`** on `RetryFuture`. Sets the ceiling on an honored
+  hint independently of policy backoff. `Retry::attempt` seeds it to `max_backoff`
+  by default; raise it (e.g. `.max_delay_hint(Duration::from_secs(300))`) to honor
+  a longer server-supplied delay without changing the exponential backoff ceiling.
+
+---
+
 ## 0.2.0 - 2026-06-11
 
 Breaking reshape of the public API. No existing consumers; safe to break.

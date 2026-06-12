@@ -55,6 +55,7 @@ The operation re-runs on every attempt, so it must be safe to repeat (see [Seman
 | `.when` | retry all | Retry only when the predicate returns `true` for the error. |
 | `.notify` | none | Run a callback before each retry sleep. |
 | `.delay_hint` | none | Override the backoff with a delay read from the error. |
+| `.max_delay_hint` | `max_backoff` | Cap an honored hint; raise to accept a longer server delay without changing policy backoff. |
 
 `.when` takes a function item or a closure:
 
@@ -104,12 +105,16 @@ Retry::new()
     .await?;
 ```
 
-`.delay_hint(fn)` lets the server set the wait. When it returns `Some(d)` for a retryable error, `d` replaces the computed backoff for that attempt, honoring an HTTP `Retry-After`. The budget and one-year clamp still bound it. The hinted sleep is also fed back as `previous` to the next policy draw, widening the next decorrelated-jitter window.
+`.delay_hint(fn)` lets the server set the wait. When it returns `Some(d)` for a retryable error, `d` replaces the computed backoff for that attempt, honoring an HTTP `Retry-After`. The honored hint is first clamped to `.max_delay_hint` (default: `max_backoff`, so a garbage `Retry-After` cannot park a retry for longer than the policy ceiling). The budget and one-year clamp still apply. The hinted sleep is fed back as `previous` to the next policy draw, widening the next decorrelated-jitter window.
+
+`.max_delay_hint(d)` raises the ceiling when the server legitimately asks for a longer wait than `max_backoff` allows, without changing policy backoff:
 
 ```rust
 Retry::new()
+    .max_backoff(Duration::from_secs(2))   // short policy backoff
     .attempt(fetch)
     .delay_hint(|e: &ThrottleError| e.retry_after)
+    .max_delay_hint(Duration::from_secs(60)) // honor up to 60s from the server
     .await?;
 ```
 
