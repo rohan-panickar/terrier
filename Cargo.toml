@@ -1,0 +1,17 @@
+[package]
+name = "terrier"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Tenacious async retries for Rust: bounded backoff with decorrelated jitter until it succeeds or the budget says stop."
+repository = "https://github.com/rohan-panickar/terrier"
+readme = "README.md"
+keywords = ["retry", "backoff", "jitter", "resilience"]
+categories = ["asynchronous", "network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
